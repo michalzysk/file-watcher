@@ -1,0 +1,146 @@
+spring:
+  application:
+    name: file-watcher-service
+  
+  # Profile-specific configurations
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:dev}
+  
+  # JSON logging for production
+  jackson:
+    default-property-inclusion: non_null
+    deserialization:
+      fail-on-unknown-properties: false
+  
+  # Integration configurations
+  integration:
+    poller:
+      default-timeout: 30000
+    channel:
+      auto-create-channel-interceptors: true
+
+# Application-specific configuration
+app:
+  smb:
+    server: ${SMB_SERVER:nas.example.com}
+    share: ${SMB_SHARE:data}
+    username: ${SMB_USERNAME:user}
+    password: ${SMB_PASSWORD:password}
+    watch-path: ${SMB_WATCH_PATH:/incoming,/priority,/archive} # Support comma-separated paths
+  
+  s3:
+    bucket: ${S3_BUCKET:data-lake}
+    region: ${S3_REGION:us-east-1}
+    access-key-id: ${AWS_ACCESS_KEY_ID:}
+    secret-access-key: ${AWS_SECRET_ACCESS_KEY:}
+  
+  trino:
+    host: ${TRINO_HOST:trino.example.com}
+    port: ${TRINO_PORT:443}
+    user: ${TRINO_USER:admin}
+    catalog: ${TRINO_CATALOG:hive}
+    schema: ${TRINO_SCHEMA:default}
+  
+  processing:
+    max-workers: ${MAX_WORKERS:5}
+    queue-capacity: ${QUEUE_MAX_SIZE:100}
+    polling-interval: ${POLLING_INTERVAL:5000}
+  
+  pattern:
+    filename-regex: ${FILENAME_PATTERN:(?<date>\\d{8})_(?<type>[A-Z]+)_(?<source>\\w+)\\.(?<ext>\\w+)}
+    s3-key-template: ${S3_KEY_TEMPLATE:data/{date}/{type}/{source}/{filename}}
+
+# Server configuration
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+  tomcat:
+    threads:
+      max: 200
+      min-spare: 10
+
+# Management endpoints (Spring Boot Actuator)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,integrationgraph
+  endpoint:
+    health:
+      show-details: when-authorized
+      show-components: always
+      probes:
+        enabled: true
+    metrics:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      application: ${spring.application.name}
+      environment: ${spring.profiles.active}
+  info:
+    build:
+      enabled: true
+    git:
+      enabled: true
+      mode: full
+
+# Logging configuration
+logging:
+  level:
+    com.company.filewatcher: ${LOG_LEVEL:INFO}
+    org.springframework.integration: ${INTEGRATION_LOG_LEVEL:INFO}
+    com.hierynomus.smbj: WARN
+    software.amazon.awssdk: WARN
+  pattern:
+    console: "%clr(%d{yyyy-MM-dd HH:mm:ss.SSS}){faint} %clr(%5p) %clr(${PID:- }){magenta} %clr(---){faint} %clr([%15.15t]){faint} %clr(%-40.40logger{39}){cyan} %clr(:){faint} %m%n%wEx"
+    file: "%d{yyyy-MM-dd HH:mm:ss.SSS} %5p ${PID:- } --- [%t] %-40.40logger{39} : %m%n%wEx"
+  file:
+    name: ${LOG_FILE:logs/file-watcher.log}
+    max-size: 10MB
+    max-history: 30
+
+# Spring Boot 3.3.5 specific features
+spring.threads.virtual.enabled: true  # Enable virtual threads (Java 21)
+
+---
+# Development profile
+spring:
+  config:
+    activate:
+      on-profile: dev
+  
+logging:
+  level:
+    com.company.filewatcher: DEBUG
+    org.springframework.integration: DEBUG
+
+app:
+  processing:
+    max-workers: 2
+    queue-capacity: 50
+
+---
+# Production profile
+spring:
+  config:
+    activate:
+      on-profile: prod
+
+logging:
+  level:
+    com.company.filewatcher: INFO
+    org.springframework.integration: WARN
+    root: WARN
+  
+app:
+  processing:
+    max-workers: 10
+    queue-capacity: 200
+
+management:
+  endpoint:
+    health:
+      show-details: never
