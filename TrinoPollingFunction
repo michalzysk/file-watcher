@@ -1,0 +1,79 @@
+public class TrinoPollingFunction extends KeyedProcessFunction<String, MyInput, MyOutput> {
+
+    // ... (definicje waitingState, inFlightState jak wcześniej)
+
+    // Zamiast queryId, trzymamy "nextUri", bo to jest nasz wskaźnik postępu
+    private transient ValueState<String> nextUriState;
+    private transient SimpleTrinoClient trinoClient;
+
+    @Override
+    public void open(Configuration parameters) {
+        // ... (reszta initu)
+        nextUriState = getRuntimeContext().getState(new ValueStateDescriptor<>("nextUri", String.class));
+        trinoClient = new SimpleTrinoClient("http://trino-coordinator:8080");
+    }
+
+    // Uruchomienie nowego zapytania
+    private void startNewQueryOrWait(Context ctx) throws Exception {
+        // ... (przygotowanie batcha z waitingState) ...
+        
+        // Generujemy SQL (uważaj na SQL Injection przy sklejaniu stringów!)
+        String sql = buildSql(batchToProcess); 
+
+        // 1. POST
+        String initialNextUri = trinoClient.startQuery(sql);
+        
+        // 2. Zapisujemy URI do stanu (żeby przetrwało awarię Flinka)
+        nextUriState.update(initialNextUri);
+
+        // 3. Rejestrujemy timer (poll za 2 sekundy)
+        ctx.timerService().registerProcessingTimeTimer(ctx.timerService().currentProcessingTime() + 2000);
+    }
+
+    @Override
+    public void onTimer(long timestamp, OnTimerContext ctx, Collector<MyOutput> out) throws Exception {
+        String currentUri = nextUriState.value();
+        
+        if (currentUri == null) {
+            // Stan niespójny lub brak aktywnego zapytania -> restart
+            startNewQueryOrWait(ctx);
+            return;
+        }
+
+        // 1. GET (Pobranie statusu/danych)
+        SimpleTrinoClient.TrinoStepResponse response = trinoClient.getNextStep(currentUri);
+
+        // 2. Obsługa błędów
+        if (response.isFailed()) {
+            System.err.println("Trino Error: " + response.error);
+            // Logika retry: wyczyść nextUri i spróbuj startNewQueryOrWait()
+            nextUriState.clear();
+            startNewQueryOrWait(ctx);
+            return;
+        }
+
+        // 3. Czy przyszły jakieś dane (rows)?
+        if (response.data != null && !response.data.isMissingNode()) {
+            // Parsujemy wyniki i emitujemy
+            // response.data to zazwyczaj tablica tablic wartości [[col1, col2], [col1, col2]]
+            for (JsonNode row : response.data) {
+                 MyOutput result = parseRow(row);
+                 out.collect(result);
+            }
+        }
+
+        // 4. Decyzja co dalej
+        if (!response.isFinished()) {
+            // A. Zapytanie trwa dalej -> Aktualizujemy URI i ustawiamy kolejny timer
+            nextUriState.update(response.nextUri);
+            ctx.timerService().registerProcessingTimeTimer(ctx.timerService().currentProcessingTime() + 2000);
+        } else {
+            // B. Zapytanie skończone (brak nextUri)
+            nextUriState.clear();
+            inFlightState.clear(); // Możemy zwolnić bufor "in-flight"
+            
+            // Od razu sprawdzamy, czy czekają nowe dane w waitingState
+            startNewQueryOrWait(ctx);
+        }
+    }
+}
