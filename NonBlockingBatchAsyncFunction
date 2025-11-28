@@ -1,0 +1,111 @@
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.functions.async.ResultFuture;
+import org.apache.flink.streaming.api.functions.async.RichAsyncFunction;
+import org.apache.flink.api.java.tuple.Tuple2;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+public class NonBlockingBatchAsyncFunction extends RichAsyncFunction<MyInput, MyOutput> {
+
+    // 1. Thread-safe kolejka. Tu wpadają requesty z głównego wątku Flinka.
+    // ConcurrentLinkedQueue jest nieblokująca (non-blocking).
+    private transient ConcurrentLinkedQueue<Tuple2<MyInput, ResultFuture<MyOutput>>> queue;
+
+    // 2. Flaga: czy nasz "Worker" aktualnie pracuje nad jakimś batchem?
+    private transient AtomicBoolean processingInProgress;
+
+    // 3. Pula wątków (wystarczy jeden wątek, skoro baza ma być odpytywana sekwencyjnie)
+    private transient ExecutorService executor;
+
+    @Override
+    public void open(Configuration parameters) {
+        queue = new ConcurrentLinkedQueue<>();
+        processingInProgress = new AtomicBoolean(false);
+        // Tworzymy osobny wątek do ciężkiej pracy
+        executor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "Async-DB-Worker");
+            t.setDaemon(true);
+            return t;
+        });
+    }
+
+    @Override
+    public void close() {
+        if (executor != null) executor.shutdownNow();
+    }
+
+    @Override
+    public void asyncInvoke(MyInput input, ResultFuture<MyOutput> resultFuture) {
+        // --- WĄTEK GŁÓWNY FLINKA (To dzieje się błyskawicznie) ---
+
+        // 1. Dodajemy do kolejki (nie blokujemy!)
+        queue.add(Tuple2.of(input, resultFuture));
+
+        // 2. Próbujemy uruchomić Workera.
+        // Jeśli Worker już pracuje (processingInProgress == true), to nic nie robimy.
+        // Dane po prostu czekają w kolejce, a Flink bierze kolejny element ze strumienia.
+        triggerWorkerIfIdle();
+    }
+
+    private void triggerWorkerIfIdle() {
+        // CAS (Compare-And-Set): Jeśli jest false, ustaw na true i wejdź do środka.
+        // Jeśli już jest true, zwróć false i wyjdź.
+        if (processingInProgress.compareAndSet(false, true)) {
+            executor.submit(this::processQueueLoop);
+        }
+    }
+
+    // --- WĄTEK ROBOCZY (To dzieje się w tle) ---
+    private void processQueueLoop() {
+        try {
+            // Pętla: dopóki są dane w kolejce, przetwarzaj je.
+            while (!queue.isEmpty()) {
+
+                // A. Pobierz WSZYSTKO co się uzbierało (tzw. drain)
+                List<Tuple2<MyInput, ResultFuture<MyOutput>>> batch = new ArrayList<>();
+
+                // Limitujemy np. do 10k, żeby nie zrobić OOM, jeśli baza padnie na godzinę
+                int limit = 10_000;
+                while (limit-- > 0 && !queue.isEmpty()) {
+                    Tuple2<MyInput, ResultFuture<MyOutput>> el = queue.poll();
+                    if (el != null) batch.add(el);
+                }
+
+                if (batch.isEmpty()) break;
+
+                // B. Wykonaj DŁUGIE zapytanie (5 minut)
+                // W tym czasie `queue` rośnie, bo Flink wciąż tam wrzuca nowe dane!
+                MyDbResult dbResult = executeLongQuery(batch);
+
+                // C. Zwróć wynik (sukces)
+                for (var req : batch) {
+                    // Tu zwracasz swój obiekt sukcesu
+                    req.f1.complete(Collections.singleton(new MyOutput("SUCCESS", dbResult)));
+                }
+            }
+        } catch (Exception e) {
+            // Obsługa błędów krytyczna!
+            // Jeśli tu nie obsłużysz wyjątku, future'y nigdy nie zostaną zakończone
+            // i checkpointy Flinka zawisną.
+        } finally {
+            // D. Zwolnij flagę.
+            processingInProgress.set(false);
+
+            // E. Race Condition check:
+            // Mogło się zdarzyć, że w milisekundzie między `while(!queue.isEmpty)` a `set(false)`
+            // wpadł nowy element. Dlatego po zwolnieniu flagi sprawdzamy jeszcze raz.
+            if (!queue.isEmpty()) {
+                triggerWorkerIfIdle();
+            }
+        }
+    }
+
+    private MyDbResult executeLongQuery(List<?> batch) {
+        // Symulacja 5 minut pracy
+        try { Thread.sleep(5000); } catch (InterruptedException e) {}
+        return new MyDbResult();
+    }
+}
