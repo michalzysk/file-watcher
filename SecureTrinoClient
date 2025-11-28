@@ -1,0 +1,113 @@
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.security.KeyManagementException;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
+import java.time.Duration;
+import java.util.Base64;
+import java.security.cert.X509Certificate;
+
+public class SecureTrinoClient {
+
+    private final HttpClient client;
+    private final String coordinatorUrl; // Musi zaczynać się od https://
+    private final ObjectMapper mapper;
+    private final String basicAuthHeader; // Zakodowane hasło
+    private final String trinoUser;
+
+    public SecureTrinoClient(String coordinatorUrl, String user, String password) {
+        this.coordinatorUrl = coordinatorUrl;
+        this.trinoUser = user;
+        this.mapper = new ObjectMapper();
+
+        // 1. Przygotowanie nagłówka Basic Auth
+        String auth = user + ":" + password;
+        String encodedAuth = Base64.getEncoder().encodeToString(auth.getBytes(StandardCharsets.UTF_8));
+        this.basicAuthHeader = "Basic " + encodedAuth;
+
+        // 2. Konfiguracja klienta HTTP (z obsługą SSL)
+        this.client = createHttpClient();
+    }
+    
+    // Metoda tworząca klienta. 
+    // W produkcji powinieneś używać domyślnego SSLContext.
+    // W dev/test często trzeba zignorować błędy certyfikatów (self-signed).
+    private HttpClient createHttpClient() {
+        try {
+            // OSTRZEŻENIE: To wyłącza weryfikację certyfikatów (dla środowisk testowych/wewnętrznych)
+            // Na produkcji skonfiguruj TrustStore poprawnie!
+            TrustManager[] trustAllCerts = new TrustManager[]{
+                new X509TrustManager() {
+                    public X509Certificate[] getAcceptedIssuers() { return null; }
+                    public void checkClientTrusted(X509Certificate[] certs, String authType) {}
+                    public void checkServerTrusted(X509Certificate[] certs, String authType) {}
+                }
+            };
+
+            SSLContext sslContext = SSLContext.getInstance("TLS");
+            sslContext.init(null, trustAllCerts, new SecureRandom());
+
+            return HttpClient.newBuilder()
+                    .sslContext(sslContext) // Wstrzykujemy nasz "luźny" SSL
+                    .connectTimeout(Duration.ofSeconds(10))
+                    .build();
+        } catch (NoSuchAlgorithmException | KeyManagementException e) {
+            throw new RuntimeException("Failed to init SSL", e);
+        }
+    }
+
+    public String startQuery(String sql) throws IOException, InterruptedException {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(coordinatorUrl + "/v1/statement"))
+                .header("X-Trino-User", trinoUser) // Nadal wymagane!
+                .header("Authorization", basicAuthHeader) // TU JEST UWIERZYTELNIANIE
+                .POST(HttpRequest.BodyPublishers.ofString(sql))
+                .build();
+
+        return sendAndGetNextUri(request);
+    }
+
+    public TrinoStepResponse getNextStep(String nextUri) throws IOException, InterruptedException {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(nextUri))
+                .header("X-Trino-User", trinoUser)
+                .header("Authorization", basicAuthHeader) // Przy każdym requeście (GET też)!
+                .GET()
+                .build();
+
+        return sendAndProcessResponse(request);
+    }
+
+    // ... (metody pomocnicze sendAndGetNextUri, sendAndProcessResponse itp. analogicznie jak wcześniej)
+    
+    // Helper do obsługi response
+    private String sendAndGetNextUri(HttpRequest request) throws IOException, InterruptedException {
+         HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+         if (response.statusCode() != 200) {
+             throw new RuntimeException("Trino Error " + response.statusCode() + ": " + response.body());
+         }
+         JsonNode root = mapper.readTree(response.body());
+         return root.get("nextUri").asText();
+    }
+    
+    private TrinoStepResponse sendAndProcessResponse(HttpRequest request) throws IOException, InterruptedException {
+        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() != 200) {
+             // 503 oznacza często "Trino zajęte", warto obsłużyć retry
+             throw new RuntimeException("Trino Error " + response.statusCode());
+        }
+        return new TrinoStepResponse(mapper.readTree(response.body()));
+    }
+    
+    // ... klasa TrinoStepResponse bez zmian
+}
