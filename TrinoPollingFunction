@@ -1,79 +1,131 @@
+import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
+import org.apache.flink.util.Collector;
+import org.apache.flink.api.common.state.ListState;
+import org.apache.flink.api.common.state.ListStateDescriptor;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.configuration.Configuration;
+
+import java.util.ArrayList;
+import java.util.List;
+
 public class TrinoPollingFunction extends KeyedProcessFunction<String, MyInput, MyOutput> {
 
-    // ... (definicje waitingState, inFlightState jak wcześniej)
+    // Stan 1: Bufor na nowe dane (Waiting Room)
+    private transient ListState<MyInput> waitingState;
+    
+    // Stan 2: Dane aktualnie mielone przez Trino (Processing Room)
+    private transient ListState<MyInput> inFlightState;
+    
+    // Stan 3: ID zapytania w Trino
+    private transient ValueState<String> currentQueryIdState;
+    
+    // Stan 4: Timestamp następnego polla (żeby nie rejestrować timerów dubli)
+    private transient ValueState<Long> nextPollTimerState;
 
-    // Zamiast queryId, trzymamy "nextUri", bo to jest nasz wskaźnik postępu
-    private transient ValueState<String> nextUriState;
-    private transient SimpleTrinoClient trinoClient;
+    private static final long POLL_INTERVAL_MS = 5000; // Sprawdzaj co 5 sekund
 
     @Override
     public void open(Configuration parameters) {
-        // ... (reszta initu)
-        nextUriState = getRuntimeContext().getState(new ValueStateDescriptor<>("nextUri", String.class));
-        trinoClient = new SimpleTrinoClient("http://trino-coordinator:8080");
+        waitingState = getRuntimeContext().getListState(new ListStateDescriptor<>("waiting", MyInput.class));
+        inFlightState = getRuntimeContext().getListState(new ListStateDescriptor<>("in-flight", MyInput.class));
+        currentQueryIdState = getRuntimeContext().getState(new ValueStateDescriptor<>("query-id", String.class));
+        nextPollTimerState = getRuntimeContext().getState(new ValueStateDescriptor<>("timer", Long.class));
+        
+        // Tu zainicjalizuj lekkiego klienta HTTP (np. OkHttp, Apache HttpClient)
     }
 
-    // Uruchomienie nowego zapytania
+    @Override
+    public void processElement(MyInput value, Context ctx, Collector<MyOutput> out) throws Exception {
+        // 1. Zawsze wrzucamy do poczekalni
+        waitingState.add(value);
+
+        // 2. Jeśli nic się aktualnie nie mieli, próbujemy uruchomić nowe zapytanie
+        if (currentQueryIdState.value() == null) {
+            startNewQueryOrWait(ctx);
+        }
+        // Jeśli queryId != null, to znaczy że Trino pracuje.
+        // My tylko dodaliśmy element do waitingState i kończymy. Flink jest wolny.
+    }
+
     private void startNewQueryOrWait(Context ctx) throws Exception {
-        // ... (przygotowanie batcha z waitingState) ...
-        
-        // Generujemy SQL (uważaj na SQL Injection przy sklejaniu stringów!)
-        String sql = buildSql(batchToProcess); 
+        // Przenieś dane z Waiting -> InFlight
+        Iterable<MyInput> waiting = waitingState.get();
+        if (waiting == null || !waiting.iterator().hasNext()) {
+            return; // Bufor pusty, nic nie robimy
+        }
 
-        // 1. POST
-        String initialNextUri = trinoClient.startQuery(sql);
+        List<MyInput> batchToProcess = new ArrayList<>();
+        waiting.forEach(batchToProcess::add);
         
-        // 2. Zapisujemy URI do stanu (żeby przetrwało awarię Flinka)
-        nextUriState.update(initialNextUri);
+        // Czyścimy waiting, zapisujemy inFlight
+        waitingState.clear();
+        inFlightState.update(batchToProcess);
 
-        // 3. Rejestrujemy timer (poll za 2 sekundy)
-        ctx.timerService().registerProcessingTimeTimer(ctx.timerService().currentProcessingTime() + 2000);
+        // --- HTTP CALL (Start Query) ---
+        // To trwa milisekundy (tylko POST z treścią zapytania)
+        String queryId = myHttpClient.submitQueryToTrino(batchToProcess); 
+        
+        currentQueryIdState.update(queryId);
+
+        // Rejestrujemy timer na sprawdzenie statusu za 5s
+        schedulePoll(ctx, POLL_INTERVAL_MS);
     }
 
     @Override
     public void onTimer(long timestamp, OnTimerContext ctx, Collector<MyOutput> out) throws Exception {
-        String currentUri = nextUriState.value();
+        String queryId = currentQueryIdState.value();
         
-        if (currentUri == null) {
-            // Stan niespójny lub brak aktywnego zapytania -> restart
+        if (queryId == null) {
+            // Dziwny stan (np. po restarcie, jeśli logiki czyszczenia były inne),
+            // ale bezpiecznie spróbujmy uruchomić nowe zapytanie jeśli są dane
             startNewQueryOrWait(ctx);
             return;
         }
 
-        // 1. GET (Pobranie statusu/danych)
-        SimpleTrinoClient.TrinoStepResponse response = trinoClient.getNextStep(currentUri);
+        // --- HTTP CALL (Check Status) ---
+        // Szybki GET po status
+        TrinoStatus status = myHttpClient.getQueryStatus(queryId);
 
-        // 2. Obsługa błędów
-        if (response.isFailed()) {
-            System.err.println("Trino Error: " + response.error);
-            // Logika retry: wyczyść nextUri i spróbuj startNewQueryOrWait()
-            nextUriState.clear();
-            startNewQueryOrWait(ctx);
-            return;
-        }
-
-        // 3. Czy przyszły jakieś dane (rows)?
-        if (response.data != null && !response.data.isMissingNode()) {
-            // Parsujemy wyniki i emitujemy
-            // response.data to zazwyczaj tablica tablic wartości [[col1, col2], [col1, col2]]
-            for (JsonNode row : response.data) {
-                 MyOutput result = parseRow(row);
-                 out.collect(result);
-            }
-        }
-
-        // 4. Decyzja co dalej
-        if (!response.isFinished()) {
-            // A. Zapytanie trwa dalej -> Aktualizujemy URI i ustawiamy kolejny timer
-            nextUriState.update(response.nextUri);
-            ctx.timerService().registerProcessingTimeTimer(ctx.timerService().currentProcessingTime() + 2000);
-        } else {
-            // B. Zapytanie skończone (brak nextUri)
-            nextUriState.clear();
-            inFlightState.clear(); // Możemy zwolnić bufor "in-flight"
+        if (status.isFinished()) {
+            // A. SUKCES
+            TrinoResult result = myHttpClient.fetchResults(queryId);
             
-            // Od razu sprawdzamy, czy czekają nowe dane w waitingState
+            // Pobieramy dane, które brały udział w tym zapytaniu
+            Iterable<MyInput> processedInputs = inFlightState.get();
+            
+            // Emitujemy wyniki
+            for (MyInput input : processedInputs) {
+                out.collect(transform(input, result));
+            }
+            
+            // Czyścimy stan przetwarzania
+            inFlightState.clear();
+            currentQueryIdState.clear();
+            nextPollTimerState.clear();
+
+            // NATYCHMIAST sprawdzamy, czy w międzyczasie coś wpadło do waitingState
             startNewQueryOrWait(ctx);
+
+        } else if (status.isFailed()) {
+            // B. PORAŻKA
+            // Decyzja: Retry czy Dead Letter Queue?
+            // Np. prosty retry: nie czyścimy inFlightState, tylko clearujemy queryId
+            // i wołamy startNewQueryOrWait (który wyśle nowe zapytanie dla tych samych danych)
+            System.err.println("Query failed, retrying...");
+            currentQueryIdState.clear();
+            startNewQueryOrWait(ctx); 
+
+        } else {
+            // C. W TRAKCIE (RUNNING / QUEUED)
+            // Po prostu czekamy dalej.
+            schedulePoll(ctx, POLL_INTERVAL_MS);
         }
+    }
+
+    private void schedulePoll(Context ctx, long delay) throws Exception {
+        long nextTimer = ctx.timerService().currentProcessingTime() + delay;
+        ctx.timerService().registerProcessingTimeTimer(nextTimer);
+        nextPollTimerState.update(nextTimer);
     }
 }
